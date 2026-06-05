@@ -1,0 +1,266 @@
+from __future__ import annotations
+
+import numpy as np
+
+import nimporter
+
+from neat.neat_nim import (
+    add_topology,
+    remove_topology,
+    init_population as init_population_nim,
+    crossover_and_add_to_population,
+    select_and_tournament,
+    add_node,
+    add_edge,
+    mutate_all,
+    migrate_islands as migrate_nim,
+    reset_top_islands as reset_islands_nim,
+    evaluate_nn_single,
+    backprop_nn_single,
+    evaluate_population,
+    get_topology_info,
+    save_json_to_file,
+    get_population_complexities
+)
+
+# functions
+
+def exists(v):
+    return v is not None
+
+def default(v, d):
+    return v if exists(v) else d
+
+def log(t, eps = 1e-20):
+    return np.log(np.clip(t, a_min = eps, a_max = None))
+
+def bernoulli(p):
+    return np.random.binomial(1, p)
+
+# sampling
+
+def gumbel_sample(t, temperature = 1., eps = 1e-20):
+    if temperature > 0.:
+        t = t / temperature
+        u = np.random.uniform(0., 1., t.shape).astype(np.float32).clip(eps, 1. - eps)
+        t = t - log(-log(u, eps), eps)
+
+    return t.argmax(axis = -1).tolist()
+
+# topology
+
+class Topology:
+    def __init__(
+        self,
+        num_inputs,
+        num_outputs,
+        pop_size,
+        num_hiddens = 32,
+        shape: tuple[int, ...] | None = None,
+        mutation_hyper_params = None,
+        crossover_hyper_params = None,
+        selection_hyper_params = None,
+        num_islands = 1,
+        num_recurrent = 0
+    ):
+        if isinstance(num_hiddens, int):
+            num_hiddens = (num_hiddens,)
+
+        self.id = add_topology(
+            num_inputs,
+            num_outputs,
+            num_hiddens,
+            mutation_hyper_params,
+            crossover_hyper_params,
+            selection_hyper_params,
+            num_islands,
+            num_recurrent
+        )
+
+        self.init_population(pop_size)
+
+        self.pop_size = pop_size
+        self.shape = shape
+
+        if exists(shape):
+            assert len(shape) == num_inputs
+
+    def __del__(self):
+        remove_topology(self.id)
+
+    def init_population(self, pop_size):
+        return init_population_nim(self.id, pop_size)
+
+    def add_neuron(self):
+        return add_node(self.id)
+
+    def add_synapse(self, from_id, to_id):
+        return add_edge(self.id, from_id, to_id)
+
+class GeneticAlgorithm:
+    def stats(self):
+        return [get_topology_info(top_id) for top_id in self.all_top_ids]
+
+    def save_json(self, filename):
+        for top_id in self.all_top_ids:
+            save_json_to_file(top_id, f'{filename}.id.{top_id}.json')
+
+    def genetic_algorithm_step(
+        self,
+        fitnesses,
+        selection_hyper_params = None,
+        mutation_hyper_params = None,
+        crossover_hyper_params = None,
+        migrate_num = 0,
+        reset_islands_num = 0,
+        reset_islands_tournament_size = 3,
+        prob_weigh_complexity_as_fitness: float = 0.0,
+        simplicity_weight: float = 1.0,
+        eps: float = 1e-8
+    ):
+
+        # 1. selection
+        # 2. tournament -> parent pairs
+
+        weigh_complexity_as_fitness = bernoulli(prob_weigh_complexity_as_fitness)
+
+        if weigh_complexity_as_fitness:
+            complexities = np.array(get_population_complexities(self.all_top_ids[0]))
+            simplicity_fitness_score = 1.0 / (complexities + eps)
+            fitnesses_list = (fitnesses + simplicity_weight * simplicity_fitness_score).tolist()
+        else:
+            fitnesses_list = fitnesses.tolist()
+
+        (
+            sel_indices,
+            sel_fitnesses,
+            couples,
+            target_nn_ids
+        ) = select_and_tournament(self.all_top_ids, fitnesses_list, selection_hyper_params)
+
+        # 3. compute children with crossover
+        # 4. concat children to population
+
+        crossover_and_add_to_population(self.all_top_ids, couples, target_nn_ids, crossover_hyper_params)
+
+        # 5. migration
+
+        if migrate_num > 0:
+            migrate_nim(self.all_top_ids, migrate_num)
+
+        # 6. island reset
+
+        if reset_islands_num > 0:
+            reset_islands_nim(self.all_top_ids, fitnesses_list, reset_islands_num, reset_islands_tournament_size)
+
+        # 7. mutation
+
+        mutate_all(self.all_top_ids, mutation_hyper_params)
+
+class NEAT(GeneticAlgorithm):
+    def __init__(
+        self,
+        *dims,
+        pop_size,
+        mutation_hyper_params = None,
+        crossover_hyper_params = None,
+        selection_hyper_params = None,
+        num_islands = 1,
+        num_recurrent = 0
+    ):
+        self.dims = dims
+        assert len(dims) >= 2
+
+        dim_in = dims[0]
+        dim_out = dims[-1]
+        dim_hiddens = list(dims[1:-1])
+
+        self.dim_out = dim_out
+        self.num_recurrent = num_recurrent
+
+        self.output = np.empty((pop_size, self.dim_out + self.num_recurrent), dtype = np.float32)
+
+        self.top = Topology(
+            dim_in,
+            dim_out,
+            num_hiddens = dim_hiddens,
+            pop_size = pop_size,
+            mutation_hyper_params = mutation_hyper_params,
+            crossover_hyper_params = crossover_hyper_params,
+            selection_hyper_params = selection_hyper_params,
+            num_islands = num_islands,
+            num_recurrent = num_recurrent
+        )
+        self.all_top_ids = [self.top.id]
+
+        self.recurrent_state = None
+        self.single_recurrent_state = None
+
+    def reset_recurrent_state(self):
+        self.recurrent_state = None
+        self.single_recurrent_state = None
+
+    def single_forward(
+        self,
+        index: int,
+        state,
+        sample = False,
+        temperature = 1.
+    ):
+        has_recurrent = self.num_recurrent > 0
+
+        if has_recurrent:
+            self.single_recurrent_state = default(self.single_recurrent_state, np.zeros(self.num_recurrent, dtype = np.float32))
+            state = np.concatenate((state, self.single_recurrent_state))
+
+        logits = np.array(evaluate_nn_single(self.top.id, index, state.tolist(), use_exec_cache = True), dtype = np.float32)
+
+        if has_recurrent:
+            logits, self.single_recurrent_state = logits[:-self.num_recurrent], logits[-self.num_recurrent:].copy()
+
+        if not sample:
+            return logits
+
+        return gumbel_sample(logits, temperature = temperature)
+
+    def forward(
+        self,
+        state,
+        sample = False,
+        temperature = 1.,
+    ):
+        has_recurrent = self.num_recurrent > 0
+
+        if has_recurrent:
+            batch, *_ = state.shape
+            self.recurrent_state = default(self.recurrent_state, np.zeros((batch, self.num_recurrent), dtype = np.float32))
+            state = np.concatenate((state, self.recurrent_state), axis = -1)
+
+        input = np.ascontiguousarray(state, dtype = np.float32)
+
+        evaluate_population(self.top.id, input, self.output)
+
+        out = self.output
+
+        if has_recurrent:
+            out, self.recurrent_state = out[:, :-self.num_recurrent], out[:, -self.num_recurrent:].copy()
+
+        if not sample:
+            return out
+
+        return gumbel_sample(out, temperature = temperature)
+
+    def backprop(
+        self,
+        index: int,
+        state,
+        target,
+        learning_rate: float = 0.01
+    ):
+        backprop_nn_single(
+            self.top.id,
+            index,
+            state.tolist(),
+            target.tolist(),
+            learning_rate
+        )

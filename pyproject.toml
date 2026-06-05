@@ -1,0 +1,60 @@
+[project]
+name = "x-neat"
+version = "0.0.1"
+description = "NEAT"
+authors = [
+    { name = "Phil Wang", email = "lucidrains@gmail.com" }
+]
+readme = "README.md"
+requires-python = ">= 3.10"
+license = { file = "LICENSE" }
+keywords = [
+    'artificial intelligence',
+    'deep learning',
+    'neuroevolutionary algorithms',
+]
+
+classifiers=[
+    'Development Status :: 4 - Beta',
+    'Intended Audience :: Developers',
+    'Topic :: Scientific/Engineering :: Artificial Intelligence',
+    'License :: OSI Approved :: MIT License',
+    'Programming Language :: Python :: 3.9',
+]
+
+dependencies = [
+    "einops>=0.8.1",
+    "nimporter",
+    "numpy",
+    "setuptools"
+]
+
+[project.urls]
+Homepage = "https://pypi.org/project/x-neat/"
+Repository = "https://github.com/lucidrains/neat"
+
+[project.optional-dependencies]
+examples = []
+test = [
+    "pytest"
+]
+
+gym = [
+    "box2d-py",
+    "fire",
+    "gymnasium[box2d]>=1.0.0",
+    "moviepy>=1.0.3",
+    "numpy>=2.2.5",
+    "swig",
+    "tqdm",
+    "wandb[media]"
+]
+
+[tool.pytest.ini_options]
+pythonpath = [
+  "."
+]
+
+[build-system]
+requires = ["setuptools", "nimporter"]
+build-backend = "setuptools.build_meta"
